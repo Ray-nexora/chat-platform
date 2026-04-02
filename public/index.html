@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chat platform demo</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b98a5;
+      --accent: #1d9bf0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 1.5rem;
+    }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 1rem; }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+    label { font-size: 0.75rem; color: var(--muted); display: block; margin-bottom: 0.25rem; }
+    input, select, button, textarea {
+      background: var(--panel);
+      border: 1px solid #2f3b4d;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+    }
+    button {
+      background: var(--accent);
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { filter: brightness(1.08); }
+    button.secondary { background: #2f3b4d; }
+    #log {
+      width: min(640px, 100%);
+      flex: 1;
+      min-height: 280px;
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 1rem;
+      overflow: auto;
+      font-size: 0.85rem;
+      line-height: 1.45;
+      border: 1px solid #2f3b4d;
+    }
+    .msg { margin-bottom: 0.75rem; padding-bottom: 0.75rem; border-bottom: 1px solid #2f3b4d; }
+    .msg:last-child { border-bottom: none; }
+    .meta { color: var(--muted); font-size: 0.75rem; margin-bottom: 0.25rem; }
+    .pill { display: inline-block; background: #2f3b4d; padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.7rem; }
+    img, audio { max-width: 100%; margin-top: 0.35rem; border-radius: 8px; }
+    textarea { width: 100%; min-height: 56px; resize: vertical; }
+    .status { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+    #typingLine { font-size: 0.8rem; color: var(--accent); min-height: 1.2em; margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>Chat platform demo</h1>
+  <div class="row">
+    <div>
+      <label>Your user id</label>
+      <input id="userId" value="user-a" />
+    </div>
+    <div style="align-self: flex-end;">
+      <button type="button" class="secondary" id="tokenBtn">Get JWT</button>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>Thread</label>
+      <input id="threadId" value="demo" />
+    </div>
+    <div style="align-self: flex-end;">
+      <button type="button" id="connectBtn">Connect WS</button>
+    </div>
+  </div>
+  <div class="row">
+    <div style="flex: 1; min-width: 200px;">
+      <label>Message type</label>
+      <select id="msgType">
+        <option value="text">text</option>
+        <option value="emoji">emoji</option>
+        <option value="gif">gif</option>
+        <option value="image">image</option>
+        <option value="audio">audio</option>
+      </select>
+    </div>
+  </div>
+  <div class="row" style="width: min(640px, 100%);">
+    <textarea id="text" placeholder="Text or emoji…"></textarea>
+  </div>
+  <div class="row">
+    <input id="attachUrl" placeholder="Optional media URL (gif/image/audio)" style="flex: 1;" />
+    <button type="button" id="sendBtn">POST / send</button>
+  </div>
+  <p class="status" id="status">Get a JWT, then connect WS (token in query). REST uses Authorization: Bearer.</p>
+  <p id="typingLine" aria-live="polite"></p>
+  <div id="log"></div>
+  <script>
+    const origin = window.location.origin.replace(/^http/, "ws");
+    const STORAGE_JWT = "chat_platform_demo_jwt";
+    const STORAGE_USER = "chat_platform_demo_user";
+    const FETCH_TIMEOUT_MS = 15000;
+    const TYPING_STOP_MS = 2500;
+    let ws = null;
+    let accessToken = null;
+    let typingIdleTimer = null;
+    /** @type {Record<string, true>} */
+    var typingPeerIds = {};
+
+    function el(id) { return document.getElementById(id); }
+
+    function logLine(html) {
+      const d = document.createElement("div");
+      d.className = "msg";
+      d.innerHTML = html;
+      el("log").prepend(d);
+    }
+
+    function restoreSession() {
+      try {
+        const t = sessionStorage.getItem(STORAGE_JWT);
+        const u = sessionStorage.getItem(STORAGE_USER);
+        if (t && u) {
+          accessToken = t;
+          el("userId").value = u;
+          el("status").textContent =
+            "Session restored. Connect WebSocket or send messages.";
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    function persistSession(userId, token) {
+      try {
+        sessionStorage.setItem(STORAGE_JWT, token);
+        sessionStorage.setItem(STORAGE_USER, userId);
+      } catch (_) {}
+    }
+
+    function clearStoredSession() {
+      try {
+        sessionStorage.removeItem(STORAGE_JWT);
+        sessionStorage.removeItem(STORAGE_USER);
+      } catch (_) {}
+    }
+
+    /**
+     * @param {{ silent?: boolean }} [opts] — if silent, do not show "Getting JWT…" (used after restore).
+     */
+    async function fetchToken(opts) {
+      const silent = opts && opts.silent;
+      const userId = el("userId").value || "anon";
+      if (!silent) el("status").textContent = "Getting JWT…";
+
+      const controller = new AbortController();
+      const timer = setTimeout(function () {
+        controller.abort();
+      }, FETCH_TIMEOUT_MS);
+
+      try {
+        const r = await fetch("/api/auth/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId }),
+          signal: controller.signal,
+        });
+        if (!r.ok) {
+          if (!silent) el("status").textContent = "Token error " + r.status;
+          else el("status").textContent = "Could not refresh JWT (HTTP " + r.status + "). Using session if still valid.";
+          if (!accessToken) clearStoredSession();
+          return;
+        }
+        const data = await r.json();
+        accessToken = data.accessToken;
+        persistSession(userId, accessToken);
+        el("status").textContent = silent
+          ? "Session refreshed. Connect WebSocket or send messages."
+          : "JWT issued. Connect WebSocket or send messages.";
+      } catch (err) {
+        var aborted = err && err.name === "AbortError";
+        if (aborted) {
+          el("status").textContent = accessToken
+            ? "Refresh timed out (" + FETCH_TIMEOUT_MS / 1000 + "s). Using cached session — check server/DB."
+            : "Request timed out (" + FETCH_TIMEOUT_MS / 1000 + "s). Is the API running and DATABASE_URL correct?";
+        } else if (!silent || !accessToken) {
+          el("status").textContent = "Error: " + (err && err.message ? err.message : String(err));
+        } else {
+          el("status").textContent = "Could not refresh JWT. Using cached session.";
+        }
+        if (!accessToken) clearStoredSession();
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    function connect() {
+      if (!accessToken) {
+        el("status").textContent = "Get JWT first.";
+        return;
+      }
+      if (ws) { ws.close(); }
+      const threadId = encodeURIComponent(el("threadId").value || "demo");
+      const token = encodeURIComponent(accessToken);
+      ws = new WebSocket(`${origin}/ws?threadId=${threadId}&token=${token}`);
+      ws.onopen = () => { el("status").textContent = "WebSocket connected."; };
+      ws.onclose = () => {
+        el("status").textContent = "WebSocket closed.";
+        typingPeerIds = {};
+        el("typingLine").textContent = "";
+      };
+      ws.onerror = () => { el("status").textContent = "WebSocket error."; };
+      ws.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.event === "message") {
+            const m = data.payload;
+            let body = escapeHtml(m.text || "");
+            if (m.attachments && m.attachments.length) {
+              for (const a of m.attachments) {
+                if (a.kind === "gif" || a.kind === "image") body += "<br><img src=\"" + escapeAttr(a.url) + "\" alt=\"\" />";
+                if (a.kind === "audio") body += "<br><audio controls src=\"" + escapeAttr(a.url) + "\"></audio>";
+              }
+            }
+            logLine("<div class=\"meta\"><span class=\"pill\">" + escapeHtml(m.type) + "</span> " + escapeHtml(m.senderId) + " · " + escapeHtml(m.createdAt) + "</div>" + body);
+          } else if (data.event === "typing") {
+            var p = data.payload;
+            if (p.typing) typingPeerIds[p.userId] = true;
+            else delete typingPeerIds[p.userId];
+            var ids = Object.keys(typingPeerIds);
+            el("typingLine").textContent = ids.length
+              ? ids.map(function (id) { return id + " is typing…"; }).join(" · ")
+              : "";
+          }
+        } catch (_) {}
+      };
+    }
+
+    function wsSendTyping(typing) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.send(JSON.stringify({ typing: typing }));
+      } catch (_) {}
+    }
+
+    function onComposerInput() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (typingIdleTimer) clearTimeout(typingIdleTimer);
+      wsSendTyping(true);
+      typingIdleTimer = setTimeout(function () {
+        typingIdleTimer = null;
+        wsSendTyping(false);
+      }, TYPING_STOP_MS);
+    }
+
+    function onComposerBlur() {
+      if (typingIdleTimer) {
+        clearTimeout(typingIdleTimer);
+        typingIdleTimer = null;
+      }
+      wsSendTyping(false);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
+    }
+    function escapeAttr(s) { return escapeHtml(s); }
+
+    async function send() {
+      if (!accessToken) {
+        el("status").textContent = "Get JWT first.";
+        return;
+      }
+      const threadId = el("threadId").value || "demo";
+      const type = el("msgType").value;
+      const text = el("text").value;
+      const url = el("attachUrl").value.trim();
+      const body = {
+        type,
+        text: text || undefined,
+        attachments: url
+          ? [{ kind: type === "gif" ? "gif" : type === "audio" ? "audio" : "image", url }]
+          : undefined,
+      };
+      const r = await fetch("/api/threads/" + encodeURIComponent(threadId) + "/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + accessToken,
+        },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        logLine("<div class=\"meta\">Error " + r.status + "</div>");
+        return;
+      }
+      if (typingIdleTimer) {
+        clearTimeout(typingIdleTimer);
+        typingIdleTimer = null;
+      }
+      wsSendTyping(false);
+      el("text").value = "";
+    }
+
+    el("tokenBtn").onclick = function () {
+      fetchToken({});
+    };
+    el("connectBtn").onclick = connect;
+    el("sendBtn").onclick = send;
+    el("text").addEventListener("input", onComposerInput);
+    el("text").addEventListener("blur", onComposerBlur);
+
+    var hadSession = restoreSession();
+    fetchToken({ silent: hadSession });
+  </script>
+</body>
+</html>
